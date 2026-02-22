@@ -2,6 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 import re
 import javalang
+
 from erd_agent.model import Schema, Column, Ref
 from erd_agent.parsers.base import Parser
 
@@ -28,7 +29,9 @@ COLLECTION_TYPES = {"List", "Set", "Collection", "Iterable"}
 
 class JPAJavaParser(Parser):
     def can_parse(self, path: Path, text: str) -> bool:
-        return path.suffix.lower() == ".java" and ("@Entity" in text or "@Table" in text)
+        # 스캐너가 이미 @Entity 중심으로 후보를 만들어주지만,
+        # 안전하게 여기서도 @Entity 확인
+        return path.suffix.lower() == ".java" and "@Entity" in text
 
     def parse(self, path: Path, text: str, schema: Schema) -> None:
         try:
@@ -41,7 +44,9 @@ class JPAJavaParser(Parser):
                 continue
 
             ann_names = {a.name for a in (t.annotations or [])}
-            if "Entity" not in ann_names and "Table" not in ann_names:
+
+            # ✅ 엔티티 판별은 @Entity로만
+            if "Entity" not in ann_names:
                 continue
 
             table_name = self._resolve_table_name(t)
@@ -49,14 +54,12 @@ class JPAJavaParser(Parser):
 
             for field in getattr(t, "fields", []) or []:
                 anns = {a.name: a for a in (field.annotations or [])}
-
-                # 컬렉션/관계의 경우 단순 컬럼이 아닐 수 있음
                 raw_type = self._simple_type(field.type)
 
                 for declarator in field.declarators:
                     var_name = declarator.name
 
-                    # 관계 매핑 우선 처리
+                    # ---- 관계 처리 ----
                     if "ManyToOne" in anns or "OneToOne" in anns:
                         join_col = self._join_column_name(field)
                         fk_col_name = join_col or f"{camel_to_snake(var_name)}_id"
@@ -68,40 +71,36 @@ class JPAJavaParser(Parser):
                                 nullable=True
                             )
 
-                        parent_entity = raw_type
-                        parent_table = camel_to_snake(parent_entity)
+                        parent_table = camel_to_snake(raw_type)
                         schema.refs.append(Ref(
                             child_table=table_name,
                             child_column=fk_col_name,
                             parent_table=parent_table,
                             parent_column="id",
-                            rel=">"  # many-to-one 기본 형태 [2](https://docs.dbdiagram.io/relationships/)[1](https://dbml.dbdiagram.io/docs/)
+                            rel=">"  # many-to-one 기준 [3](https://docs.oracle.com/en/java/javase/24/docs/api/java.base/java/lang/classfile/AnnotationElement.html)[4](https://jastadd.cs.lth.se/releases/extendj/8.0.1/doc/org/extendj/ast/ElementValuePair.html)
                         ))
                         continue
 
-                    # ManyToMany는 JoinTable이 있으면 조인 테이블 생성(간단 버전)
                     if "ManyToMany" in anns:
                         jt = self._join_table(field)
                         if jt:
                             join_table, join_col, inv_col = jt
                             jt_table = schema.ensure_table(join_table)
-                            # 조인 테이블 컬럼
+
                             if join_col not in jt_table.columns:
                                 jt_table.columns[join_col] = Column(join_col, "bigint", nullable=False)
                             if inv_col not in jt_table.columns:
                                 jt_table.columns[inv_col] = Column(inv_col, "bigint", nullable=False)
-                            # refs (조인 테이블 -> 양쪽 테이블)
+
                             schema.refs.append(Ref(join_table, join_col, table_name, "id", ">"))
                             schema.refs.append(Ref(join_table, inv_col, camel_to_snake(raw_type), "id", ">"))
                         continue
 
-                    # OneToMany는 FK가 자식 테이블에 존재하는데, 심볼 해석 없이 완전 추론이 어려워
-                    # mappedBy로 "반대편이 ManyToOne을 가지고 있을 가능성"이 높으므로
-                    # 여기서는 중복/오탐을 줄이기 위해 기본은 스킵(향후 강화 포인트).
                     if "OneToMany" in anns:
+                        # 양방향 추론은 오탐 위험이 커서 기본 스킵(향후 확장 포인트)
                         continue
 
-                    # 일반 컬럼 처리
+                    # ---- 일반 컬럼 처리 ----
                     col = Column(
                         name=camel_to_snake(var_name),
                         db_type=JAVA_TYPE_MAP.get(raw_type, "varchar"),
@@ -115,16 +114,14 @@ class JPAJavaParser(Parser):
                         col.nullable = False
 
                     if "GeneratedValue" in anns:
-                        col.increment = True  # IDENTITY 등 자동 생성 의미 [11](https://stackoverflow.com/questions/20603638/what-is-the-use-of-annotations-id-and-generatedvaluestrategy-generationtype)[12](https://www.geeksforgeeks.org/advance-java/hibernate-generatedvalue-annotation-in-jpa/)
+                        col.increment = True  # DB 자동생성 의미 [5](https://developers.openai.com/cookbook/examples/azure/chat)[6](https://coderivers.org/blog/azure-openai-python/)
 
-                    # @Enumerated 등은 일단 varchar로 처리(확장 가능)
                     if "Enumerated" in anns:
                         col.db_type = "varchar"
 
                     table.columns[col.name] = col
 
     def _simple_type(self, t) -> str:
-        # List<Book> 같은 경우: t.name == "List", t.arguments[0].type.name == "Book"
         try:
             name = t.name
             if name in COLLECTION_TYPES and getattr(t, "arguments", None):
@@ -137,25 +134,27 @@ class JPAJavaParser(Parser):
             return "String"
 
     def _resolve_table_name(self, class_decl) -> str:
-        # @Table(name="STUDENT", schema="SCHOOL") 가능 [3](https://www.baeldung.com/jpa-entities)
-        table = None
-        schema = None
+        """
+        - 엔티티 이름: @Entity(name=...)가 있으면 반영 가능 [1](https://docs.dbdiagram.io/dbml/)
+        - 테이블 이름: @Table(name=...)가 있으면 최우선, 없으면 엔티티명/클래스명 기반 [1](https://docs.dbdiagram.io/dbml/)[2](https://github.com/openai/openai-python/blob/main/examples/azure.py)
+        - 스키마: @Table(schema=...)가 있으면 schema.table로 생성 (DBML 지원) [4](https://jastadd.cs.lth.se/releases/extendj/8.0.1/doc/org/extendj/ast/ElementValuePair.html)
+        """
         entity_name = class_decl.name
+        table_name = None
+        schema_name = None
 
         for a in (class_decl.annotations or []):
             if a.name == "Entity":
-                # @Entity(name="student") 가능 [3](https://www.baeldung.com/jpa-entities)
                 n = self._ann_kv(a, "name")
                 if n:
                     entity_name = n
-            if a.name == "Table":
-                table = self._ann_kv(a, "name")
-                schema = self._ann_kv(a, "schema")
+            elif a.name == "Table":
+                table_name = self._ann_kv(a, "name")
+                schema_name = self._ann_kv(a, "schema")
 
-        base = table or camel_to_snake(entity_name)
-        if schema:
-            # DBML: Table schema.table 지원 [1](https://dbml.dbdiagram.io/docs/)
-            return f"{schema}.{base}"
+        base = table_name or camel_to_snake(entity_name)
+        if schema_name:
+            return f"{schema_name}.{base}"
         return base
 
     def _apply_column_annotation(self, col: Column, ann) -> None:
@@ -173,7 +172,6 @@ class JPAJavaParser(Parser):
 
         length = self._ann_kv(ann, "length")
         if length and col.db_type.startswith("varchar"):
-            # DBML 타입은 단어 1개(공백 없이)면 허용되는 케이스가 많아 varchar(255)로 표현 [1](https://dbml.dbdiagram.io/docs/)
             col.db_type = f"varchar({length})"
 
     def _join_column_name(self, field) -> str | None:
@@ -183,7 +181,6 @@ class JPAJavaParser(Parser):
         return None
 
     def _join_table(self, field):
-        # @JoinTable(name="user_roles", joinColumns=@JoinColumn(name="user_id"), inverseJoinColumns=@JoinColumn(name="role_id"))
         for a in (field.annotations or []):
             if a.name != "JoinTable":
                 continue
@@ -202,13 +199,11 @@ class JPAJavaParser(Parser):
         return None
 
     def _ann_nested_joincol(self, ann, key: str) -> str | None:
-        # JoinTable 안에 joinColumns=@JoinColumn(name="x") 형태
         pairs = ann.element if isinstance(ann.element, list) else ([ann.element] if ann.element else [])
         for p in pairs:
             if getattr(p, "name", None) != key:
                 continue
             v = getattr(p, "value", None)
-            # v는 Annotation(JoinColumn)일 수 있음
             if getattr(v, "name", None) == "JoinColumn":
                 return self._ann_kv(v, "name")
         return None
